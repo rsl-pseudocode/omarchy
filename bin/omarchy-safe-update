@@ -1,0 +1,152 @@
+#!/bin/bash
+#
+# Safe Omarchy Update Script
+# Checks for dangerous migrations before updating
+#
+
+set -e
+
+OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
+cd "$OMARCHY_PATH"
+
+echo "🔍 Safe Omarchy Update Checker"
+echo "================================"
+echo ""
+
+# Step 1: Setup upstream remote if not exists
+echo "📡 Step 1: Checking upstream remote..."
+if ! git remote | grep -q "^upstream$"; then
+    echo "   Setting up upstream remote (Basecamp)..."
+    git remote add upstream https://github.com/basecamp/omarchy.git
+    echo "   ✅ Upstream remote added"
+else
+    echo "   ✅ Upstream remote already configured"
+fi
+echo ""
+
+# Step 2: Fetch latest from upstream
+echo "⬇️  Step 2: Fetching latest updates from Basecamp..."
+git fetch upstream
+echo "   ✅ Fetch complete"
+echo ""
+
+# Step 3: Check for dangerous code in new commits
+echo "🔎 Step 3: Scanning for dangerous operations..."
+echo ""
+
+DANGEROUS_FOUND=false
+
+# Get list of new/changed migrations
+NEW_MIGRATIONS=$(git diff HEAD..upstream/main --name-only -- migrations/ 2>/dev/null || true)
+
+if [ -n "$NEW_MIGRATIONS" ]; then
+    echo "   📋 New or modified migrations found:"
+    echo "$NEW_MIGRATIONS" | sed 's/^/      - /'
+    echo ""
+
+    # Check for dangerous efibootmgr operations
+    echo "   🚨 Checking for UEFI boot entry manipulation..."
+    DANGEROUS_EFIBOOT=$(git diff HEAD..upstream/main -- migrations/ | grep -E "efibootmgr.*(--create|-c[^h])" || true)
+
+    if [ -n "$DANGEROUS_EFIBOOT" ]; then
+        echo "   ⚠️  WARNING: Found efibootmgr --create operations!"
+        echo ""
+        echo "   Dangerous code found:"
+        echo "$DANGEROUS_EFIBOOT" | sed 's/^/      /'
+        echo ""
+        DANGEROUS_FOUND=true
+    else
+        echo "   ✅ No efibootmgr --create found"
+    fi
+
+    # Check for NVRAM/EFI variable manipulation
+    echo "   🚨 Checking for NVRAM/EFI operations..."
+    DANGEROUS_NVRAM=$(git diff HEAD..upstream/main -- migrations/ | grep -Ei "efivar|nvram|uefi.*entry" || true)
+
+    if [ -n "$DANGEROUS_NVRAM" ]; then
+        echo "   ⚠️  WARNING: Found potential NVRAM manipulation!"
+        echo ""
+        echo "   Suspicious code found:"
+        echo "$DANGEROUS_NVRAM" | sed 's/^/      /'
+        echo ""
+        DANGEROUS_FOUND=true
+    else
+        echo "   ✅ No NVRAM manipulation found"
+    fi
+
+    # Check for our specifically dangerous migrations being restored
+    echo "   🚨 Checking if dangerous migrations were restored..."
+    RESTORED_BAD=$(git diff HEAD..upstream/main --name-only | grep -E "(1758487662|1762446739)" || true)
+
+    if [ -n "$RESTORED_BAD" ]; then
+        echo "   ⚠️  CRITICAL: Known dangerous migrations restored!"
+        echo ""
+        echo "   These migrations brick Dell/AMI systems:"
+        echo "$RESTORED_BAD" | sed 's/^/      - /'
+        echo ""
+        DANGEROUS_FOUND=true
+    else
+        echo "   ✅ Known dangerous migrations still deleted"
+    fi
+else
+    echo "   ℹ️  No new migrations found"
+fi
+
+echo ""
+
+# Step 4: Show version info
+echo "📊 Step 4: Version Information"
+CURRENT_VERSION=$(cat version 2>/dev/null || echo "unknown")
+UPSTREAM_VERSION=$(git show upstream/main:version 2>/dev/null || echo "unknown")
+
+echo "   Current version:  $CURRENT_VERSION"
+echo "   Upstream version: $UPSTREAM_VERSION"
+echo ""
+
+# Step 5: Summary and decision
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+if [ "$DANGEROUS_FOUND" = true ]; then
+    echo "⛔ DANGER DETECTED!"
+    echo ""
+    echo "Dangerous operations found in upstream updates."
+    echo "These could brick your Dell/AMI BIOS system."
+    echo ""
+    echo "Options:"
+    echo "  1. DO NOT UPDATE - stay on current safe version"
+    echo "  2. Manually review changes before updating"
+    echo "  3. Wait for Basecamp to fix the issues"
+    echo ""
+    read -p "Do you want to see the full diff? (y/N): " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        git diff HEAD..upstream/main -- migrations/
+    fi
+    echo ""
+    echo "❌ Update NOT recommended - cancelling for safety"
+    exit 1
+else
+    echo "✅ NO DANGERS DETECTED"
+    echo ""
+    echo "Upstream updates appear safe to merge."
+    echo ""
+    read -p "Proceed with update? (y/N): " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo ""
+        echo "🔄 Merging upstream updates..."
+        git merge upstream/main -m "Merge upstream updates (verified safe)"
+
+        echo ""
+        echo "📦 Running omarchy-update..."
+        omarchy-update
+
+        echo ""
+        echo "✅ Update complete!"
+    else
+        echo ""
+        echo "❌ Update cancelled by user"
+        exit 0
+    fi
+fi
